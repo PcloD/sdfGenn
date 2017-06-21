@@ -4,5 +4,6 @@ project(sdfGen)
 set(CMAKE_CXX_STANDARD 14)
 
 set(SOURCE_FILES main.cpp)
+
 add_executable(sdfGen ${SOURCE_FILES})
 

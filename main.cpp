@@ -4,10 +4,13 @@
 #include <cmath>
 #include <cfloat>
 #include <cassert>
+#include <algorithm>
 #include <vector>
 #include <stack>
+#include <bitset>
 #include <unordered_map>
 #include <queue>
+#include <limits.h>
 
 using namespace std;
 
@@ -24,6 +27,9 @@ extern "C" {
 #else
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/time.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <errno.h>
 #else
 #include <ctime>
 #endif
@@ -696,7 +702,6 @@ Aabb Geometry::getTriangleAabb(int triIndex) const
     return aabb;
 }
 
-
 template<typename V>
 class BVH
 {
@@ -1039,7 +1044,7 @@ struct SDFComputer
         m_bvh.build(faceAabbs, m_leafIndexToFaceIndex);
     }
 
-    template <typename T> int sgn(T val) const {
+    template<typename T> int sgn(T val) const {
         return (T(0) < val) - (val < T(0));
     }
 
@@ -1055,7 +1060,7 @@ struct SDFComputer
 
     inline bool getClosestPointOnMesh(const Vec4 &wsP, Vec4 &closestPoint, Vec4 &closestPointNormal) const
     {
-        const float startBoxSize = 1.0e-1 * m_bvh.getRootVol().size();
+        const float startBoxSize = 3.0e-2 * m_bvh.getRootVol().size();
         const float growthRate = 2.0;
         const int maxIters = 256;
         // Make a test cube of the specified size centered on the test point wsP
@@ -1310,6 +1315,9 @@ static void uint64_rollright_big(unsigned char shift, uint64_glsl& io)
     io.m_hi = 0;
 }
 
+
+
+
 class Octree
 {
 public:
@@ -1464,10 +1472,10 @@ public:
 
         static inline Vec4 nodeCorner(uint32_t nodeCode)
         {
-            uint64_t depth = nodeDepth(nodeCode); // Extract depth bits
+            uint32_t depth = nodeDepth(nodeCode); // Extract depth bits
             nodeCode &= ~(depth<<27UL);           // Zero depth bits
             char d3 = 3*depth;                    // Construct the original Morton key
-            uint64_t key = nodeCode << (27UL-d3);
+            uint32_t key = nodeCode << (27UL-d3);
             Vec4 tmp = decodeMorton(key);
             return decodeMorton(key);
         }
@@ -1582,6 +1590,7 @@ Octree::Octree(const Geometry& geometry, const SDFComputer& sdf, const float sdf
 
         // Always bust into the first 8 children at least
         bool shouldBust = _nodeDepth<=1;
+        shouldBust = true; // !!! For now always generate fully busted octree, i.e. all leaves are at max depth
 
         // And also bust octree node if any corner's SDF differs from the center SDF by more than a tolerance distance
         NodeSDF nSDF;
@@ -1609,13 +1618,178 @@ Octree::Octree(const Geometry& geometry, const SDFComputer& sdf, const float sdf
     }
 }
 
+class Grid {
+public:
+
+    Grid(const Geometry &geometry, const SDFComputer &sdf, const int resolution) :
+
+            m_geometry(geometry), m_sdf(sdf)
+
+    {
+        Aabb aabb = geometry.computeAabb();
+
+        m_origin = aabb.m_minima;
+        Vec4 extent = aabb.m_maxima - aabb.m_minima;
+
+        double max_edge;
+        int max_cardinal = extent.maxIndex(max_edge);
+        m_voxelWidth = max_edge / double(resolution);
+        m_res[max_cardinal] = resolution;
+        m_res[(max_cardinal+1)%3] = ceil(extent[(max_cardinal+1)%3] / m_voxelWidth);
+        m_res[(max_cardinal+2)%3] = ceil(extent[(max_cardinal+2)%3] / m_voxelWidth);
+
+        m_numValues = (m_res[0]) * (m_res[1]) * (m_res[2]);
+        m_data = new double[m_numValues];
+
+        // sample SDFs
+        for (size_t k=0; k<m_res[2]; ++k)
+        {
+            std::cout << "Sampling SDF on grid, " << 100.0*double(k)/double(m_res[0]) << "% done" << std::endl;
+            double z = m_origin[2] + (double(k)+0.5)*m_voxelWidth;
+
+            for (size_t j=0; j<m_res[1]; ++j)
+            {
+                double y = m_origin[1] + (double(j)+0.5)*m_voxelWidth;
+                for (size_t i=0; i<m_res[0]; ++i)
+                {
+                    double x = m_origin[0] + (double(i)+0.5)*m_voxelWidth;
+                    int data_index = latticeToIndex(i, j, k);
+                    Vec4 wsP(x, y, z);
+                    m_data[data_index] = m_sdf.getSDF(wsP);
+                }
+            }
+        }
+    }
+
+    string getDataAsPython() const
+    {
+        string PYTHON;
+
+        PYTHON += "grid_origin = [" + to_string(m_origin.x()) + ", " + to_string(m_origin.y()) + ", " + to_string(m_origin.z()) + "]";
+        PYTHON += "\nvoxel_resolution = [" + to_string(m_res[2]) + ", " + to_string(m_res[1]) + ", " + to_string(m_res[0]) + "]";
+        PYTHON += "\nvoxel_size = " + to_string(m_voxelWidth);
+
+        PYTHON += "\nsdfs = [";
+        for (size_t n=0; n<m_numValues; ++n)
+        {
+            if (n>0) PYTHON += ", ";
+            PYTHON += to_string(m_data[n]);
+        }
+        PYTHON += "]";
+
+        return PYTHON;
+    }
+
+    string getPackedDataAsPython() const
+    {
+        // identify max absolute SDF value.
+        double sdf_absmax = 0.0;
+        for (size_t n=0; n<m_numValues; ++n)
+        {
+            double s = m_data[n];
+            if (fabs(s) > sdf_absmax) sdf_absmax = s;
+        }
+
+        std::vector<unsigned char> char_data;
+        for (size_t n=0; n<m_numValues; ++n)
+        {
+            double s = m_data[n];
+
+            // divide each SDF by absolute max, putting each in range [-1,1].
+            // multiple each by 127.5, and add 127.5, putting in range [0, 255].
+            s *= 127.5/sdf_absmax;
+            s += 127.5;
+            unsigned char c = max((unsigned char)0, min((unsigned char)255, static_cast<unsigned char>(round(s))));
+            char_data.push_back(c);
+        }
+
+        // proceed by uint, and pack 4 SDFs into each uint.
+        std::vector<unsigned int> packed_data;
+        int n = 0;
+        while (n < m_numValues)
+        {
+            unsigned int byte0 = (n<m_numValues) ? (unsigned int) char_data[n] : 0; n++;
+            unsigned int byte1 = (n<m_numValues) ? (unsigned int) char_data[n] : 0; n++;
+            unsigned int byte2 = (n<m_numValues) ? (unsigned int) char_data[n] : 0; n++;
+            unsigned int byte3 = (n<m_numValues) ? (unsigned int) char_data[n] : 0; n++;
+            unsigned int pack = byte3 | (byte2 << 8) | (byte1 << 16) | (byte0 << 24);
+            packed_data.push_back(pack);
+        }
+
+        string PYTHON;
+
+        PYTHON += "grid_origin = [" + to_string(m_origin.x()) + ", " + to_string(m_origin.y()) + ", " + to_string(m_origin.z()) + "]\n";
+        PYTHON += "\nvoxel_resolution = [" + to_string(m_res[2]) + ", " + to_string(m_res[1]) + ", " + to_string(m_res[0]) + "]\n";
+        PYTHON += "\nvoxel_size = " + to_string(m_voxelWidth);
+        PYTHON += "\nsdf_absmax = " + to_string(sdf_absmax);
+
+        PYTHON += "\npacked_sdfs = [";
+        for (size_t n=0; n<packed_data.size(); ++n)
+        {
+            if (n>0) PYTHON += ", ";
+            PYTHON += to_string(packed_data[n]);
+        }
+        PYTHON += "]";
+
+        // Check
+        for (size_t sdf_index=0; sdf_index<m_numValues; ++sdf_index)
+        {
+            double s = m_data[sdf_index];
+
+            unsigned int packed_sdfs_index = sdf_index/4;
+            unsigned int byte = sdf_index - packed_sdfs_index*4;
+            unsigned int packed_sdf = packed_data[packed_sdfs_index];
+            unsigned int sdf_int = (packed_sdf >> 8u*(3u-byte)) & 0xFF;
+
+            double s_reconstruct = sdf_absmax * (static_cast<double>(sdf_int) - 127.5) / 127.5;
+            //std::cout << "s, s_reconstruct: " << to_string(s) << ", " << to_string(s_reconstruct) << std::endl;
+        }
+
+        return PYTHON;
+    }
+
+    template<typename T>
+    T clamp(T n, T lower, T upper) { return std::max(lower, std::min(n, upper)); }
+
+    // given world space point P, return lattice index of grid point at LL of voxel containing P
+    void worldToVoxel(const Vec4& wsP, int& x, int& y, int& z)
+    {
+        Vec4 vsP = (wsP - m_origin) / m_voxelWidth;
+        x = clamp(int(vsP[0]), 0, m_res[0]);
+        y = clamp(int(vsP[1]), 0, m_res[1]);
+        z = clamp(int(vsP[2]), 0, m_res[2]);
+    }
+
+    int latticeToIndex(int x, int y, int z)
+    {
+        return z + m_res[2]*(y + m_res[1]*x);
+    }
+
+private:
+
+    const Geometry& m_geometry;
+    const SDFComputer& m_sdf;
+
+    Vec4 m_origin;
+    double m_voxelWidth;
+    int m_res[3]; // voxel counts along grid edges
+
+    // voxel data at all voxel corners
+    int m_numValues; // (m_res[0]+1) * (m_res[1]+1) * (m_res[2]+1)
+    double *m_data; // m_numValues doubles
+
+};
+
 /////////////////////////////////////////////////////////////////////////////////////////
 // main
 /////////////////////////////////////////////////////////////////////////////////////////
 
+
 static void doIt()
 {
-    std::string inputfile = "/Users/jamports/ClionProjects/Mesher/resources/sphere.obj";
+    std::string inputfile = "../resources/bunny.obj";
+    //std::string inputfile = "../resources/sphere.obj";
+
     std::cout << "Loading " << inputfile << std::endl;
 
     tinyobj::attrib_t attrib;
@@ -1683,17 +1857,27 @@ static void doIt()
     SDFComputer SDF(geometry);
 
     // Build adaptive SDF octree
-    const float sdfVariance=0.1;
-    const int maxDepth=1;
+    /*
+    const float sdfVariance=0.0;
+    const int maxDepth=2;
     Octree octree(geometry, SDF, sdfVariance, maxDepth);
 
     vector<Octree::LEAF> leaves;
     octree.getLeaves(leaves);
+     */
 
-    //////////////////////////////////////////////////////////////////////////////////////
-    // create python code for attempting to set up SDF in shadertoy
-    //////////////////////////////////////////////////////////////////////////////////////
+    Grid grid(geometry, SDF, 32);
 
+    std::ofstream out("../sdf.txt");
+
+    std::cout  << "\n\n########################## Python code #################################\n" << std::endl;
+    string data = grid.getDataAsPython();
+    std::cout << data << std::endl;
+    out << data;
+    std::cout  << "\n########################## Python code  end #################################\n" << std::endl;
+
+
+    /*
     string PYTHON;
 
     // write node codes array (successive lo, hi bits of sorted Morton codes)
@@ -1702,13 +1886,16 @@ static void doIt()
     std::cout << "\n\n########################## Python code #################################\n" << std::endl;
 
     Vec4 O = octree.getOrigin();
-    PYTHON += "octree_origin = [" + to_string(O.x()) + ", " + to_string(O.x()) + ", " + to_string(O.x()) + "]\n";
+    PYTHON += "octree_origin = [" + to_string(O.x()) + ", " + to_string(O.y()) + ", " + to_string(O.z()) + "]\n";
     PYTHON += "octree_edge = " + to_string(octree.getEdge());
 
+    unsigned char maxLeafDepth = 0;
     PYTHON += "\nmorton_codes = [";
     for (size_t l=0; l<leaves.size(); ++l)
     {
         uint32_t code = leaves[l].first;
+        unsigned char depth = Octree::nodeDepth(code);
+        if (depth>maxLeafDepth) maxLeafDepth = depth;
         if (l>0) PYTHON += ", ";
         PYTHON += to_string(code);
     }
@@ -1727,8 +1914,14 @@ static void doIt()
         }
     }
     PYTHON += "]";
+
+    PYTHON += "\nmaxLeafDepth = " + to_string(maxLeafDepth);
+
     std:cout << PYTHON << std::endl;
     std::cout << "\n########################## Python code  end #################################\n" << std::endl;
+
+     */
+
 
     /*
         for (size_t l=0; l<leaves.size(); ++l)
